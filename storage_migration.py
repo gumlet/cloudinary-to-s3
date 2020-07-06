@@ -3,7 +3,6 @@ import re
 import tqdm
 import requests
 import argparse
-import concurrent.futures
 import cloudinary
 import cloudinary.uploader
 import cloudinary.api
@@ -151,10 +150,11 @@ def run(args):
             args.target_parent_path
         )
 
-    show_mapping(
-        source_to_target_mapper_dict,
-        args.s3_endpoint_url,
-        args.s3_bucket_name)
+    if args.verbose:
+        show_mapping(
+            source_to_target_mapper_dict,
+            args.s3_endpoint_url,
+            args.s3_bucket_name)
 
     with requests.Session() as sess:
         for rs_type, data_list in source_to_target_mapper_dict.items():
@@ -204,7 +204,7 @@ if __name__ == "__main__":
         "--s3_endpoint_url",
         type=str,
         required=True,
-        help="Region name for s3 bucket."
+        help="S3 endpoint url"
     )
     parser.add_argument(
         "--s3_access_key_id",
