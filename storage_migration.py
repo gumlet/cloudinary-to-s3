@@ -1,13 +1,13 @@
 import os
 import re
-import tqdm
+from tqdm import tqdm
 import requests
 import argparse
 import cloudinary
 import cloudinary.uploader
 import cloudinary.api
 import boto3
-
+import concurrent.futures
 
 def set_cloudinary_config(cloud_name, api_key, api_secret):
     try:
@@ -26,7 +26,7 @@ def create_s3_resource_client(s3_endpoint_url, s3_access_key_id, s3_secret_acces
         )
         return False, s3
     except Exception as err:
-        return True, str(err)    
+        return True, str(err)
 
 def get_cloudinary_resource_list(resource_types):
 
@@ -56,7 +56,7 @@ def get_cloudinary_resource_list(resource_types):
                             )
                         else:
                             break
-        return resource_url_list_dict            
+        return resource_url_list_dict
     except Exception as err:
         print("Error ocurred in getting cloudinary resource URLs: {}".format(str(err)))
         return {}
@@ -69,7 +69,7 @@ def filter_urls_base_on_folder_names(source_buckets, url_list):
         for url in url_list:
             if sb in url:
                 filtered_urls.append(url)
-    return list(set(filtered_urls))            
+    return list(set(filtered_urls))
 
 def source_to_target_mapper(url_list, keep_same_structure, parent_path):
     source_to_target_map = []
@@ -81,23 +81,37 @@ def source_to_target_mapper(url_list, keep_same_structure, parent_path):
         if parent_path:
             url_split = parent_path.strip("/") + "/" + url_split
         source_to_target_map.append([url, url_split])
-    return source_to_target_map                
+    return source_to_target_map
 
-def show_mapping(source_to_target_mapper_dict, s3_endpoint_url, s3_bucket_name):
+def show_sample_mapping(source_to_target_mapper_dict, s3_endpoint_url, s3_bucket_name):
     for key, value in source_to_target_mapper_dict.items():
         print("Mapping {}: Soruce URL => Target URL".format(key))
         print("------------------------------------------------------------------------------------")
-        for source, target in value:
+        for source, target in value[:5]:
             target = s3_endpoint_url.strip("/") + "/" + s3_bucket_name + "/" + target
             print("{} ==> {}".format(source,target))
-        print("\n")    
+        print("\n")
 
 def migrate_data(data, s3_client, s3_bucket_name, session):
     source, target = data
+
+    if args.resuming_download:
+        #ignore if already uploaded to s3...
+        try:
+            s3_object_meta = s3_client.meta.client.head_object(
+                Bucket = s3_bucket_name,
+                Key = target
+            )
+        except Exception as head_err:
+            s3_object_meta = None
+
+        if s3_object_meta:
+            return False, data
+
     try:
         res = session.get(source)
     except Exception as get_err:
-        return True, str(get_err)
+        return True, data
 
     try:
         put_resp = s3_client.meta.client.put_object(
@@ -106,14 +120,14 @@ def migrate_data(data, s3_client, s3_bucket_name, session):
             Key=target
         )
     except Exception as put_err:
-        return True, str(put_err)
-    return False, put_resp       
+        return True, data
+    return False, put_resp
 
 def run(args):
 
     err, msg = set_cloudinary_config(
-        args.cloudinary_cloud_name, 
-        args.cloudinary_api_key, 
+        args.cloudinary_cloud_name,
+        args.cloudinary_api_key,
         args.cloudinary_api_secret,
     )
 
@@ -133,6 +147,7 @@ def run(args):
 
     cloudinary_resource_urls_dict = get_cloudinary_resource_list(args.resource_types)
 
+
     if not cloudinary_resource_urls_dict:
         print("No resources to be migrated.")
 
@@ -150,11 +165,15 @@ def run(args):
             args.target_parent_path
         )
 
-    if args.verbose:
-        show_mapping(
-            source_to_target_mapper_dict,
-            args.s3_endpoint_url,
-            args.s3_bucket_name)
+    # if args.verbose:
+    show_sample_mapping(
+        source_to_target_mapper_dict,
+        args.s3_endpoint_url,
+        args.s3_bucket_name)
+
+    confirm = input("Please check your input data once and confirm : [yes]")
+    if confirm.lower() != 'yes':
+        return
 
     with requests.Session() as sess:
         for rs_type, data_list in source_to_target_mapper_dict.items():
@@ -162,18 +181,31 @@ def run(args):
             failed_count = 0
             print("Migrating {} {} type resources.".format(len(data_list), rs_type))
             print("------------------------------------------------------------------------------------")
-            for data in tqdm.tqdm(data_list):
-                err, resp = migrate_data(data, s3, args.s3_bucket_name, sess)
+            pbar = tqdm(total=len(data_list))
+            progress = 0
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers = args.max_worker) as executor:
+
+                future_to_data = {executor.submit(migrate_data, data, s3, args.s3_bucket_name, sess): data for data in data_list}
+                for future in concurrent.futures.as_completed(future_to_data):
+                    # output = future_to_data[future]
+                    progress += 1
+                    pbar.update(progress)
+                try:
+                    err,resp = future.result()
+                except Exception as ex:
+                    print("Exception : ",ex)
+
                 if err:
                     failed_count += 1
-                results.append([err, resp, data[0]])
-            print("Migrated {}/{} {} type resources. \n".format(len(data_list)-failed_count, len(data_list), rs_type))
+                    results.append(resp)
+            pbar.close()
 
             if failed_count > 0:
                 print("Following resources failed:")
                 for r in results:
                     if r[0]:
-                        print("source URL: {}, Error Message: {}".format(r[3], r[2]))
+                        print("source URL: {}".format(r))
 
 
 if __name__ == "__main__":
@@ -250,14 +282,22 @@ if __name__ == "__main__":
         default="",
         help="Target structure will be created following specified path. (prefix path)",
     )
+
     parser.add_argument(
-        "-v",
-        "--verbose",
+        "--resuming_download",
         type=bool,
         default=False,
-        help="verbosity for script."
+        help="When kept this argument true it will skip the object already migrated to s3.",
+    )
+
+    parser.add_argument(
+        "--max_worker",
+        type=int,
+        default=25,
+        help="It limits maximum concurrent threads created during migration of resources.",
     )
 
     args = parser.parse_args()
+
 
     run(args)
