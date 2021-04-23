@@ -138,7 +138,7 @@ def show_sample_mapping(source_to_target_mapper_dict, s3_endpoint_url, s3_bucket
 def migrate_data(data, s3_client, s3_bucket_name, session):
     source, target = data
 
-    if args.resuming_download:
+    if args.resuming_migration:
         #ignore if already uploaded to s3...
         try:
             s3_object_meta = s3_client.meta.client.head_object(
@@ -267,7 +267,7 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--resuming_download",
+        "--resuming_migration",
         type=bool,
         default=False,
         help="When kept this argument true it will skip the object already migrated to s3.",

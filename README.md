@@ -40,7 +40,7 @@ python3 storage_migration.py \
 
 If you are re-running this script then use following argument to speedup the performance.
 
-`--resuming_download True`
+`--resuming_migration True`
 
 To update te max no of worker (which handles migration process in paraller) use the following argument (default is 25).
 
