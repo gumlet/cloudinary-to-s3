@@ -28,35 +28,78 @@ def create_s3_resource_client(s3_endpoint_url, s3_access_key_id, s3_secret_acces
     except Exception as err:
         return True, str(err)
 
-def get_cloudinary_resource_list(resource_types):
+def migrate_cloudinary_resources(resource_types, s3):
 
     try:
         resource_types = resource_types.split(",")
-
+        source_buckets = args.source_buckets.split(",")
+        batch_index = 0
+        batch_size = 500
         resource_url_list_dict = {}
 
-        for rs_type in resource_types:
-            rs_type = rs_type.strip()
-            resources = cloudinary.api.resources(resource_type=rs_type)
-            if resources and resources["resources"]:
-                resource_url_list_dict[rs_type] = []
-                resource_url_list_dict[rs_type].extend(
-                    list(map(lambda x: x["url"], resources["resources"]))
-                )
-                if "next_cursor" in resources:
-                    next_cursor = resources["next_cursor"]
-                    while True:
-                        new_resources = cloudinary.api.resources(
-                            resource_type=rs_type, next_cursor=next_cursor
+        with requests.Session() as sess:
+            with concurrent.futures.ThreadPoolExecutor(max_workers = args.max_worker) as executor:
+
+                for rs_type in resource_types:
+                    rs_type = rs_type.strip()
+
+                    resources = cloudinary.api.resources(resource_type=rs_type,max_results=batch_size)
+                    while resources and resources["resources"]:
+                        batch_index += 1
+                        current_batch = list(map(lambda x: x["url"], resources["resources"]))
+                        if args.source_buckets:
+                            current_batch = filter_urls_base_on_folder_names(source_buckets,current_batch)
+
+                        source_to_target_mapper_list = source_to_target_mapper(
+                            current_batch,
+                            args.keep_cloud_name_in_path,
+                            args.target_parent_path
                         )
-                        if "next_cursor" in new_resources:
-                            next_cursor = new_resources["next_cursor"]
-                            resource_url_list_dict[rs_type].extend(
-                                list(map(lambda x: x["url"], new_resources["resources"]))
-                            )
+
+                        if batch_index == 1:
+                            show_sample_mapping(
+                                source_to_target_mapper_list,
+                                args.s3_endpoint_url,
+                                args.s3_bucket_name)
+
+                            confirm = input("Please check your input data once and confirm : [yes]")
+                            if confirm.lower() != 'yes':
+                                break
+                            print("\n")
+
+                        print("Migrating batch {} ...".format(batch_index))
+                        #start migrating....
+                        pbar = tqdm(total=len(source_to_target_mapper_list))
+                        progress = 0
+                        failed_count = 0
+
+                        future_to_data = {executor.submit(migrate_data, data, s3, args.s3_bucket_name, sess): data for data in source_to_target_mapper_list}
+                        for future in concurrent.futures.as_completed(future_to_data):
+                            progress += 1
+                            pbar.update(progress)
+                        try:
+                            err,resp = future.result()
+                        except Exception as ex:
+                            print("Exception : ",ex)
+
+                        if err:
+                            failed_count += 1
+                            results.append(resp)
+
+                        pbar.close()
+
+                        if failed_count > 0:
+                            print("Following resources failed:")
+                            for r in results:
+                                if r[0]:
+                                    print("source URL: {}".format(r))
+
+                        # get the next batch....
+                        if "next_cursor" in resources:
+                            resources = cloudinary.api.resources(resource_type=rs_type, max_results=batch_size, next_cursor=resources["next_cursor"])
                         else:
                             break
-        return resource_url_list_dict
+
     except Exception as err:
         print("Error ocurred in getting cloudinary resource URLs: {}".format(str(err)))
         return {}
@@ -72,7 +115,7 @@ def filter_urls_base_on_folder_names(source_buckets, url_list):
     return list(set(filtered_urls))
 
 def source_to_target_mapper(url_list, keep_same_structure, parent_path):
-    source_to_target_map = []
+    source_to_target_list = []
     for url in url_list:
         if not keep_same_structure:
             url_split = re.split(r"(\bimage\b|\bvideo\b|\braw\b)/upload/v[0-9]+/", url)[-1]
@@ -80,17 +123,17 @@ def source_to_target_mapper(url_list, keep_same_structure, parent_path):
             url_split = "/".join(url.split("/")[3:])
         if parent_path:
             url_split = parent_path.strip("/") + "/" + url_split
-        source_to_target_map.append([url, url_split])
-    return source_to_target_map
+        source_to_target_list.append([url, url_split])
+    return source_to_target_list
 
 def show_sample_mapping(source_to_target_mapper_dict, s3_endpoint_url, s3_bucket_name):
-    for key, value in source_to_target_mapper_dict.items():
-        print("Mapping {}: Soruce URL => Target URL".format(key))
-        print("------------------------------------------------------------------------------------")
-        for source, target in value[:5]:
-            target = s3_endpoint_url.strip("/") + "/" + s3_bucket_name + "/" + target
-            print("{} ==> {}".format(source,target))
-        print("\n")
+    print("\n#Sample Mapping")
+    print("------------------------------------------------------")
+    for source,target in source_to_target_mapper_dict[:5]:
+        target = s3_endpoint_url.strip("/") + "/" + s3_bucket_name + "/" + target
+        print("{} ==> {}".format(source,target))
+
+    print("\n")
 
 def migrate_data(data, s3_client, s3_bucket_name, session):
     source, target = data
@@ -145,67 +188,7 @@ def run(args):
         print("Error {} ocurred in creating s3 client. check config.".format(s3))
         return
 
-    cloudinary_resource_urls_dict = get_cloudinary_resource_list(args.resource_types)
-
-
-    if not cloudinary_resource_urls_dict:
-        print("No resources to be migrated.")
-
-    source_to_target_mapper_dict = {}
-
-    for rs_type, url_list in cloudinary_resource_urls_dict.items():
-        if args.source_buckets:
-            cloudinary_resource_urls_dict[rs_type] = filter_urls_base_on_folder_names(
-                args.source_buckets,
-                url_list
-            )
-        source_to_target_mapper_dict[rs_type] = source_to_target_mapper(
-            url_list,
-            args.keep_cloud_name_in_path,
-            args.target_parent_path
-        )
-
-    # if args.verbose:
-    show_sample_mapping(
-        source_to_target_mapper_dict,
-        args.s3_endpoint_url,
-        args.s3_bucket_name)
-
-    confirm = input("Please check your input data once and confirm : [yes]")
-    if confirm.lower() != 'yes':
-        return
-
-    with requests.Session() as sess:
-        for rs_type, data_list in source_to_target_mapper_dict.items():
-            results = []
-            failed_count = 0
-            print("Migrating {} {} type resources.".format(len(data_list), rs_type))
-            print("------------------------------------------------------------------------------------")
-            pbar = tqdm(total=len(data_list))
-            progress = 0
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers = args.max_worker) as executor:
-
-                future_to_data = {executor.submit(migrate_data, data, s3, args.s3_bucket_name, sess): data for data in data_list}
-                for future in concurrent.futures.as_completed(future_to_data):
-                    # output = future_to_data[future]
-                    progress += 1
-                    pbar.update(progress)
-                try:
-                    err,resp = future.result()
-                except Exception as ex:
-                    print("Exception : ",ex)
-
-                if err:
-                    failed_count += 1
-                    results.append(resp)
-            pbar.close()
-
-            if failed_count > 0:
-                print("Following resources failed:")
-                for r in results:
-                    if r[0]:
-                        print("source URL: {}".format(r))
+    migrate_cloudinary_resources(args.resource_types,s3)
 
 
 if __name__ == "__main__":
