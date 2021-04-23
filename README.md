@@ -37,6 +37,16 @@ python3 storage_migration.py \
     --s3_secret_access_key s3_secret_key \
     --s3_bucket_name s3_bucket_name
 ```
+
+If you are re-running this script then use following argument to speedup the performance.
+
+`--resuming_download True`
+
+To update te max no of worker (which handles migration process in paraller) use the following argument (default is 25).
+
+`--max_worker 50`
+
+
 For more info, run following commmand.
 
 ```bash
