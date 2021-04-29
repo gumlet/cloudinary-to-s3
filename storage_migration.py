@@ -72,6 +72,7 @@ def migrate_cloudinary_resources(resource_types, s3):
                         pbar = tqdm(total=len(source_to_target_mapper_list))
                         progress = 0
                         failed_count = 0
+                        results = []
 
                         future_to_data = {executor.submit(migrate_data, data, s3, args.s3_bucket_name, sess): data for data in source_to_target_mapper_list}
                         for future in concurrent.futures.as_completed(future_to_data):
